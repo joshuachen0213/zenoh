@@ -733,7 +733,7 @@ impl TransmissionPipelineProducer {
             if !(&result) {
                 qstats.inc_dropped();
             } else {
-                qstats.inc_q_cnt();
+                qstats.inc_qcnt();
             }
             qstats.record_qsize();
         }
@@ -785,6 +785,14 @@ impl TransmissionPipelineConsumer {
             for (prio, queue) in self.stage_out.iter_mut().enumerate() {
                 match queue.try_pull() {
                     Pull::Some(batch) => {
+                        #[cfg(feature = "qstats")]
+                        {
+                            let mut qstat = zlock!(&self.qstats_list[prio]);
+                            batch.time.iter().for_each(|t| {
+                                qstat.dec_qcnt();
+                                qstat.push_qdelay(t.elapsed().as_micros() as usize);
+                            });
+                        }
                         return Some((batch, prio));
                     }
                     Pull::Backoff(deadline) => {
