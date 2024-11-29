@@ -28,8 +28,12 @@ use zenoh_protocol::{
     transport::{fragment::FragmentHeader, frame::FrameHeader, BatchSize, TransportMessage},
 };
 use zenoh_result::{zerror, ZResult};
+
 #[cfg(feature = "transport_compression")]
 use {std::sync::Arc, zenoh_protocol::common::imsg};
+
+#[cfg(feature = "qstats")]
+use std::time::Instant;
 
 const L_LEN: usize = (BatchSize::BITS / 8) as usize;
 const H_LEN: usize = BatchHeader::SIZE;
@@ -201,6 +205,8 @@ pub struct WBatch {
     // Statistics related to this batch
     #[cfg(feature = "stats")]
     pub stats: WBatchStats,
+    #[cfg(feature = "qstats")]
+    pub time: Vec<Instant>,
 }
 
 impl WBatch {
@@ -211,6 +217,8 @@ impl WBatch {
             config,
             #[cfg(feature = "stats")]
             stats: WBatchStats::default(),
+            #[cfg(feature = "qstats")]
+            time: Vec::new(),
         };
 
         // Bring the batch in a clear state
@@ -240,6 +248,10 @@ impl WBatch {
         #[cfg(feature = "stats")]
         {
             self.stats.clear();
+        }
+        #[cfg(feature = "qstats")]
+        {
+            self.time.clear();
         }
         Self::init(&mut self.buffer, &self.config);
     }
@@ -366,7 +378,12 @@ impl Encode<(&NetworkMessage, &FrameHeader)> for &mut WBatch {
 
     fn encode(self, x: (&NetworkMessage, &FrameHeader)) -> Self::Output {
         let mut writer = self.buffer.writer();
-        self.codec.write(&mut writer, x)
+        let res = self.codec.write(&mut writer, x);
+        #[cfg(feature = "qstats")]
+        if res.is_ok() {
+            self.time.push(Instant::now());
+        }
+        res
     }
 }
 
@@ -375,7 +392,12 @@ impl Encode<(&mut ZBufReader<'_>, &mut FragmentHeader)> for &mut WBatch {
 
     fn encode(self, x: (&mut ZBufReader<'_>, &mut FragmentHeader)) -> Self::Output {
         let mut writer = self.buffer.writer();
-        self.codec.write(&mut writer, x)
+        let result = self.codec.write(&mut writer, x);
+        #[cfg(feature = "qstats")]
+        if result.is_ok() {
+            self.time.push(Instant::now());
+        }
+        result
     }
 }
 
