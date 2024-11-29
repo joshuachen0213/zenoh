@@ -48,6 +48,8 @@ use super::{
 use crate::common::batch::BatchConfig;
 
 const RBLEN: usize = QueueSizeConf::MAX;
+#[cfg(feature = "qstats")]
+use crate::qstats::QueueStats;
 
 // Inner structure to reuse serialization batches
 struct StageInRefill {
@@ -623,6 +625,8 @@ impl TransmissionPipeline {
     ) -> (TransmissionPipelineProducer, TransmissionPipelineConsumer) {
         let mut stage_in = vec![];
         let mut stage_out = vec![];
+        #[cfg(feature = "qstats")]
+        let mut qstats_list = vec![];
 
         let default_queue_size = [config.queue_size[Priority::DEFAULT as usize]];
         let size_iter = if priority.len() == 1 {
@@ -661,6 +665,19 @@ impl TransmissionPipeline {
                     LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
                 )),
             });
+            // Not sure if it is possible to write
+            /*
+             *  #[cfg(feature = "qstats")]
+             *  {
+             *      let qstats = QueueStats::new();
+             *      qstats_list.push(qstats.clone());
+             *  }
+             **/
+            // because qstats_list will be moved and we can't use it anymore
+            #[cfg(feature = "qstats")]
+            let qstats = Mutex::new(QueueStats::new());
+            #[cfg(feature = "qstats")]
+            qstats_list.push(qstats);
 
             stage_in.push(Mutex::new(StageIn {
                 s_ref: StageInRefill { n_ref_r, s_ref_r },
@@ -687,6 +704,8 @@ impl TransmissionPipeline {
                 s_ref: StageOutRefill { n_ref_w, s_ref_w },
             });
         }
+        #[cfg(feature = "qstats")]
+        let qstats_list: Arc<[Mutex<QueueStats>]> = qstats_list.into_boxed_slice().into();
 
         let active = Arc::new(AtomicBool::new(true));
         let producer = TransmissionPipelineProducer {
@@ -694,11 +713,15 @@ impl TransmissionPipeline {
             active: active.clone(),
             wait_before_drop: config.wait_before_drop,
             wait_before_close: config.wait_before_close,
+            #[cfg(feature = "qstats")]
+            qstats_list: qstats_list.clone(),
         };
         let consumer = TransmissionPipelineConsumer {
             stage_out: stage_out.into_boxed_slice(),
             n_out_r,
             active,
+            #[cfg(feature = "qstats")]
+            qstats_list,
         };
 
         (producer, consumer)
@@ -712,6 +735,8 @@ pub(crate) struct TransmissionPipelineProducer {
     active: Arc<AtomicBool>,
     wait_before_drop: (Duration, Duration),
     wait_before_close: Duration,
+    #[cfg(feature = "qstats")]
+    qstats_list: Arc<[Mutex<QueueStats>]>,
 }
 
 impl TransmissionPipelineProducer {
@@ -733,7 +758,19 @@ impl TransmissionPipelineProducer {
         let mut deadline = Deadline::new(wait_time, max_wait_time);
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
-        queue.push_network_message(&mut msg, priority, &mut deadline)
+        let result = queue.push_network_message(&mut msg, priority, &mut deadline);
+        #[cfg(feature = "qstats")]
+        {
+            let qstats = zlock!(self.qstats_list[idx]);
+            qstats.inc_tried();
+            if !(&result) {
+                qstats.inc_dropped();
+            } else {
+                qstats.inc_q_cnt();
+            }
+            qstats.record_qsize();
+        }
+        result
     }
 
     #[inline]
@@ -769,6 +806,8 @@ pub(crate) struct TransmissionPipelineConsumer {
     stage_out: Box<[StageOut]>,
     n_out_r: Waiter,
     active: Arc<AtomicBool>,
+    #[cfg(feature = "qstats")]
+    qstats_list: Arc<[Mutex<QueueStats>]>,
 }
 
 impl TransmissionPipelineConsumer {

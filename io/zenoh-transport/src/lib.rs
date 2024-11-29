@@ -22,6 +22,9 @@ pub mod manager;
 pub mod multicast;
 pub mod unicast;
 
+#[cfg(feature = "qstats")]
+pub use common::qstats;
+
 #[cfg(feature = "stats")]
 pub use common::stats;
 

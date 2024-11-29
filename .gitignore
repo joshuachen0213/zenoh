@@ -22,3 +22,6 @@
 cargo-timing*.html
 
 ci/valgrind-check/*.log
+
+# do not track the expansion result
+io/zenoh-transport/src/common/stats_expand.rs

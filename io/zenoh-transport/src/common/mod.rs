@@ -15,6 +15,8 @@ pub mod batch;
 pub(crate) mod defragmentation;
 pub(crate) mod pipeline;
 pub(crate) mod priority;
+#[cfg(feature = "qstats")]
+pub mod qstats;
 pub(crate) mod seq_num;
 #[cfg(feature = "stats")]
 pub mod stats;
