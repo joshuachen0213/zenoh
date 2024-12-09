@@ -642,7 +642,7 @@ impl TransmissionPipeline {
              **/
             // because qstats_list will be moved and we can't use it anymore
             #[cfg(feature = "qstats")]
-            let qstats = Mutex::new(QueueStats::new());
+            let qstats = Mutex::new(QueueStats::new(prio));
             #[cfg(feature = "qstats")]
             qstats_list.push(qstats);
 
@@ -729,13 +729,13 @@ impl TransmissionPipelineProducer {
         #[cfg(feature = "qstats")]
         {
             let qstats = zlock!(self.qstats_list[idx]);
+            qstats.record_qsize();
             qstats.inc_tried();
-            if !(&result) {
+            if !result {
                 qstats.inc_dropped();
             } else {
                 qstats.inc_qcnt();
             }
-            qstats.record_qsize();
         }
         result
     }
@@ -750,7 +750,19 @@ impl TransmissionPipelineProducer {
         };
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[priority]);
-        queue.push_transport_message(msg)
+        let result = queue.push_transport_message(msg);
+        #[cfg(feature = "qstats")]
+        {
+            let qstats = zlock!(self.qstats_list[priority]);
+            qstats.record_qsize();
+            qstats.inc_tried();
+            if !result {
+                qstats.inc_dropped();
+            } else {
+                qstats.inc_qcnt();
+            }
+        }
+        result
     }
 
     pub(crate) fn disable(&self) {

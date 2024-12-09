@@ -7,13 +7,16 @@ const ALPHA: f64 = 0.1;
 
 #[derive(Clone)]
 pub struct QueueStatsReport {
+    priority: usize,
     pub avg_qsize: f64,
     pub droprate: f64,
     pub avg_qdelay: f64,
+    pub mcnt: usize,
 }
 
 pub struct QueueStats {
     queue_counter: AtomicUsize,
+    priority: usize,
     pub qsize: Arc<Mutex<Vec<usize>>>,
     pub dropped: AtomicUsize,
     pub tried: AtomicUsize,
@@ -21,9 +24,10 @@ pub struct QueueStats {
 }
 #[allow(dead_code)]
 impl QueueStats {
-    pub fn new() -> Self {
+    pub fn new(priority: usize) -> Self {
         Self {
             queue_counter: AtomicUsize::new(0),
+            priority,
             qsize: Arc::new(Mutex::new(Vec::new())),
             dropped: AtomicUsize::new(0),
             tried: AtomicUsize::new(0),
@@ -80,9 +84,11 @@ impl QueueStats {
         let droprate = if tried > 0.0 { dropped / tried } else { 0.0 };
 
         QueueStatsReport {
+            priority: self.priority,
             avg_qsize,
             droprate,
             avg_qdelay,
+            mcnt: self.tried.load(Ordering::Relaxed),
         }
     }
 }
@@ -90,16 +96,20 @@ impl QueueStats {
 impl QueueStatsReport {
     pub fn openmetrics_text(&self) -> String {
         let mut string = String::new();
-        string.push_str("=== Zenoh Queue Stats Report ===\n");
-        string.push_str("The average queue size is ");
-        string.push_str(&self.avg_qsize.to_string());
-        string.push_str("\n");
-        string.push_str("The drop rate is ");
-        string.push_str(&self.droprate.to_string());
-        string.push_str("\n");
-        string.push_str("The average queueing delay is ");
-        string.push_str(&self.avg_qdelay.to_string());
-        string.push_str("\n");
+        string.push_str(&format!(
+            "=== Zenoh Queue Stats for priority {} Report ===\n",
+            self.priority
+        ));
+        string.push_str(&format!(
+            "The average message queue size is {}\n",
+            self.avg_qsize
+        ));
+        string.push_str(&format!("The total message count is {}\n", self.mcnt));
+        string.push_str(&format!("The drop rate is {}%\n", self.droprate * 100.0));
+        string.push_str(&format!(
+            "The average queueing delay is {} us\n",
+            self.avg_qdelay
+        ));
         string.push_str("=== End of Zenoh Queue Stats Report ===\n");
         string
     }
