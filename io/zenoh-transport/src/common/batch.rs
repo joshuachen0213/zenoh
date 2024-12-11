@@ -360,7 +360,12 @@ impl Encode<&TransportMessage> for &mut WBatch {
 
     fn encode(self, x: &TransportMessage) -> Self::Output {
         let mut writer = self.buffer.writer();
-        self.codec.write(&mut writer, x)
+        let res = self.codec.write(&mut writer, x);
+        #[cfg(feature = "qstats")]
+        if res.is_ok() {
+            self.time.push(Instant::now());
+        }
+        res
     }
 }
 
@@ -369,7 +374,12 @@ impl Encode<&NetworkMessage> for &mut WBatch {
 
     fn encode(self, x: &NetworkMessage) -> Self::Output {
         let mut writer = self.buffer.writer();
-        self.codec.write(&mut writer, x)
+        let res = self.codec.write(&mut writer, x);
+        #[cfg(feature = "qstats")]
+        if res.is_ok() {
+            self.time.push(Instant::now());
+        }
+        res
     }
 }
 
@@ -392,12 +402,12 @@ impl Encode<(&mut ZBufReader<'_>, &mut FragmentHeader)> for &mut WBatch {
 
     fn encode(self, x: (&mut ZBufReader<'_>, &mut FragmentHeader)) -> Self::Output {
         let mut writer = self.buffer.writer();
-        let result = self.codec.write(&mut writer, x);
+        let res = self.codec.write(&mut writer, x);
         #[cfg(feature = "qstats")]
-        if result.is_ok() {
+        if res.is_ok() {
             self.time.push(Instant::now());
         }
-        result
+        res
     }
 }
 

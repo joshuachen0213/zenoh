@@ -2,25 +2,26 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use zenoh_core::zlock;
 
 const ALPHA: f64 = 0.1;
 
 #[derive(Clone)]
 pub struct QueueStatsReport {
     priority: usize,
-    pub avg_qsize: f64,
-    pub droprate: f64,
-    pub avg_qdelay: f64,
-    pub mcnt: usize,
+    avg_qsize: f64,
+    droprate: f64,
+    avg_qdelay: f64,
+    mcnt: usize,
 }
 
 pub struct QueueStats {
     queue_counter: AtomicUsize,
     priority: usize,
-    pub qsize: Arc<Mutex<Vec<usize>>>,
-    pub dropped: AtomicUsize,
-    pub tried: AtomicUsize,
-    pub queueing_delay: Vec<usize>,
+    qsize: Arc<Mutex<Vec<usize>>>,
+    dropped: AtomicUsize,
+    tried: AtomicUsize,
+    queueing_delay: Arc<Mutex<Vec<usize>>>,
 }
 #[allow(dead_code)]
 impl QueueStats {
@@ -31,15 +32,15 @@ impl QueueStats {
             qsize: Arc::new(Mutex::new(Vec::new())),
             dropped: AtomicUsize::new(0),
             tried: AtomicUsize::new(0),
-            queueing_delay: Vec::new(),
+            queueing_delay: Arc::new(Mutex::new(Vec::new())),
         }
     }
     pub fn record_qsize(&self) {
         let cur_qsize = self.queue_counter.load(Ordering::Relaxed);
-        self.qsize.lock().unwrap().push(cur_qsize);
+        zlock!(self.qsize).push(cur_qsize);
     }
-    pub fn push_qdelay(&mut self, delay: usize) {
-        self.queueing_delay.push(delay);
+    pub fn push_qdelay(&self, delay: usize) {
+        zlock!(self.queueing_delay).push(delay);
     }
     pub fn inc_qcnt(&self) {
         self.queue_counter.fetch_add(1, Ordering::Relaxed);
@@ -67,7 +68,7 @@ impl QueueStats {
             0.0
         };
 
-        let qdelay = &self.queueing_delay;
+        let qdelay = zlock!(self.queueing_delay);
         let avg_qdelay = if !qdelay.is_empty() {
             let avg_qdelay = qdelay[0] as f64;
             qdelay.iter()
