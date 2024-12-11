@@ -204,6 +204,8 @@ struct StageIn {
     mutex: StageInMutex,
     fragbuf: ZBuf,
     batching: bool,
+    #[cfg(feature = "qstats")]
+    qstats: Arc<QueueStats>,
 }
 
 impl StageIn {
@@ -249,6 +251,8 @@ impl StageIn {
 
         macro_rules! zretok {
             ($batch:expr, $msg:expr) => {{
+                #[cfg(feature = "qstats")]
+                self.qstats.inc_qcnt();
                 if !self.batching || $msg.is_express() {
                     // Move out existing batch
                     self.s_out.move_batch($batch);
@@ -331,6 +335,8 @@ impl StageIn {
             // Serialize the message fragment
             match batch.encode((&mut reader, &mut fragment)) {
                 Ok(_) => {
+                    #[cfg(feature = "qstats")]
+                    self.qstats.inc_qcnt();
                     // Update the SN
                     fragment.sn = tch.sn.get();
                     // Move the serialization batch into the OUT pipeline
@@ -393,6 +399,8 @@ impl StageIn {
 
         macro_rules! zretok {
             ($batch:expr) => {{
+                #[cfg(feature = "qstats")]
+                self.qstats.inc_qcnt();
                 if !self.batching {
                     // Move out existing batch
                     self.s_out.move_batch($batch);
@@ -632,19 +640,11 @@ impl TransmissionPipeline {
                     LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
                 )),
             });
-            // Not sure if it is possible to write
-            /*
-             *  #[cfg(feature = "qstats")]
-             *  {
-             *      let qstats = QueueStats::new();
-             *      qstats_list.push(qstats.clone());
-             *  }
-             **/
-            // because qstats_list will be moved and we can't use it anymore
+
             #[cfg(feature = "qstats")]
-            let qstats = Mutex::new(QueueStats::new(prio));
+            let qstats = Arc::new(QueueStats::new(prio));
             #[cfg(feature = "qstats")]
-            qstats_list.push(qstats);
+            qstats_list.push(qstats.clone());
 
             stage_in.push(Mutex::new(StageIn {
                 s_ref: StageInRefill { n_ref_r, s_ref_r },
@@ -659,6 +659,8 @@ impl TransmissionPipeline {
                 },
                 fragbuf: ZBuf::empty(),
                 batching: config.batching_enabled,
+                #[cfg(feature = "qstats")]
+                qstats,
             }));
 
             // The stage out for this priority
@@ -672,7 +674,7 @@ impl TransmissionPipeline {
             });
         }
         #[cfg(feature = "qstats")]
-        let qstats_list: Arc<[Mutex<QueueStats>]> = qstats_list.into_boxed_slice().into();
+        let qstats_list: Arc<[Arc<QueueStats>]> = qstats_list.into_boxed_slice().into();
 
         let active = Arc::new(AtomicBool::new(true));
         let producer = TransmissionPipelineProducer {
@@ -703,7 +705,7 @@ pub(crate) struct TransmissionPipelineProducer {
     wait_before_drop: Duration,
     wait_before_close: Duration,
     #[cfg(feature = "qstats")]
-    qstats_list: Arc<[Mutex<QueueStats>]>,
+    qstats_list: Arc<[Arc<QueueStats>]>,
 }
 
 impl TransmissionPipelineProducer {
@@ -728,13 +730,11 @@ impl TransmissionPipelineProducer {
         let result = queue.push_network_message(&mut msg, priority, &mut deadline);
         #[cfg(feature = "qstats")]
         {
-            let qstats = zlock!(self.qstats_list[idx]);
+            let qstats = &self.qstats_list[idx];
             qstats.record_qsize();
             qstats.inc_tried();
             if !result {
                 qstats.inc_dropped();
-            } else {
-                qstats.inc_qcnt();
             }
         }
         result
@@ -753,13 +753,11 @@ impl TransmissionPipelineProducer {
         let result = queue.push_transport_message(msg);
         #[cfg(feature = "qstats")]
         {
-            let qstats = zlock!(self.qstats_list[priority]);
+            let qstats = &self.qstats_list[priority];
             qstats.record_qsize();
             qstats.inc_tried();
             if !result {
                 qstats.inc_dropped();
-            } else {
-                qstats.inc_qcnt();
             }
         }
         result
@@ -786,7 +784,7 @@ pub(crate) struct TransmissionPipelineConsumer {
     n_out_r: Waiter,
     active: Arc<AtomicBool>,
     #[cfg(feature = "qstats")]
-    qstats_list: Arc<[Mutex<QueueStats>]>,
+    qstats_list: Arc<[Arc<QueueStats>]>,
 }
 
 impl TransmissionPipelineConsumer {
@@ -799,7 +797,7 @@ impl TransmissionPipelineConsumer {
                     Pull::Some(batch) => {
                         #[cfg(feature = "qstats")]
                         {
-                            let mut qstat = zlock!(&self.qstats_list[prio]);
+                            let qstat = &self.qstats_list[prio];
                             batch.time.iter().for_each(|t| {
                                 qstat.dec_qcnt();
                                 qstat.push_qdelay(t.elapsed().as_micros() as usize);
