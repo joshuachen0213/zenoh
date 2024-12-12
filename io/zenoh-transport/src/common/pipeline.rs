@@ -11,7 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use crossbeam_utils::CachePadded;
+use ringbuffer_spsc::{RingBuffer, RingBufferReader, RingBufferWriter};
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     ops::Add,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -19,9 +23,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use crossbeam_utils::CachePadded;
-use ringbuffer_spsc::{RingBuffer, RingBufferReader, RingBufferWriter};
 use zenoh_buffers::{
     reader::{HasReader, Reader},
     writer::HasWriter,
@@ -677,6 +678,12 @@ impl TransmissionPipeline {
         let qstats_list: Arc<[Arc<QueueStats>]> = qstats_list.into_boxed_slice().into();
 
         let active = Arc::new(AtomicBool::new(true));
+        let stage_out: Arc<Mutex<Box<[StageOut]>>> =
+            Arc::new(Mutex::new(stage_out.into_boxed_slice()));
+        let scheduler = SchedulerBuilder {
+            config: SchedulerConfig::Priority,
+        }
+        .build(stage_out.clone());
         let producer = TransmissionPipelineProducer {
             stage_in: stage_in.into_boxed_slice().into(),
             active: active.clone(),
@@ -686,7 +693,8 @@ impl TransmissionPipeline {
             qstats_list: qstats_list.clone(),
         };
         let consumer = TransmissionPipelineConsumer {
-            stage_out: stage_out.into_boxed_slice(),
+            stage_out,
+            scheduler,
             n_out_r,
             active,
             #[cfg(feature = "qstats")]
@@ -778,9 +786,250 @@ impl TransmissionPipelineProducer {
     }
 }
 
+#[derive(Default)]
+#[allow(dead_code)]
+enum SchedulerConfig {
+    #[default]
+    Priority,
+    WeightedRoundRobin(WRRConfig),
+    Custom(CustomConfig),
+}
+
+struct SchedulerBuilder {
+    config: SchedulerConfig,
+}
+
+#[derive(Clone)]
+struct WRRConfig {
+    c_window: MicroSeconds,
+    n_window: MicroSeconds,
+    weight: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct CustomConfig;
+
+impl SchedulerBuilder {
+    fn build(
+        self,
+        stage_out: Arc<Mutex<Box<[StageOut]>>>,
+    ) -> Box<dyn SchedulerTrait + Send + Sync> {
+        match &self.config {
+            SchedulerConfig::Priority => self.build_priority(stage_out),
+            SchedulerConfig::WeightedRoundRobin(config) => {
+                self.build_wrr(stage_out, config.clone())
+            }
+            SchedulerConfig::Custom(config) => self.build_custom(stage_out, config.clone()),
+        }
+    }
+
+    fn build_priority(&self, stage_out: Arc<Mutex<Box<[StageOut]>>>) -> Box<PriorityScheduler> {
+        Box::new(PriorityScheduler { stage_out })
+    }
+
+    fn build_wrr(
+        &self,
+        stage_out: Arc<Mutex<Box<[StageOut]>>>,
+        config: WRRConfig,
+    ) -> Box<WRRScheduler> {
+        let length = stage_out.lock().unwrap().len();
+        Box::new(WRRScheduler {
+            stage_out,
+            c_window_start: None,
+            n_window_start: None,
+            last_update: None,
+            virtual_time: BinaryHeap::new(),
+            weight: config.weight,
+            c_window: config.c_window,
+            n_window: config.n_window,
+            is_contention: false,
+            length,
+        })
+    }
+    #[allow(unused_variables)]
+    fn build_custom(
+        &self,
+        stage_out: Arc<Mutex<Box<[StageOut]>>>,
+        config: CustomConfig,
+    ) -> Box<CustomScheduler> {
+        Box::new(CustomScheduler { stage_out })
+    }
+}
+
+trait SchedulerTrait {
+    fn reset(&mut self);
+    fn schedule(&mut self) -> ScheduleResult;
+}
+
+enum ScheduleResult {
+    Some((WBatch, usize)),
+    Backoff(MicroSeconds),
+    None,
+}
+
+struct PriorityScheduler {
+    stage_out: Arc<Mutex<Box<[StageOut]>>>,
+}
+
+impl SchedulerTrait for PriorityScheduler {
+    fn reset(&mut self) {}
+    fn schedule(&mut self) -> ScheduleResult {
+        let mut stage_out = zlock!(self.stage_out);
+        for (prio, queue) in stage_out.iter_mut().enumerate() {
+            match queue.try_pull() {
+                Pull::Some(batch) => {
+                    return ScheduleResult::Some((batch, prio));
+                }
+                Pull::Backoff(deadline) => {
+                    return ScheduleResult::Backoff(deadline);
+                }
+                Pull::None => {}
+            }
+        }
+        ScheduleResult::None
+    }
+}
+#[allow(dead_code)]
+struct WRRScheduler {
+    stage_out: Arc<Mutex<Box<[StageOut]>>>,
+    c_window_start: Option<Instant>, // start of the contention window
+    n_window_start: Option<Instant>, // start of the non-contention window
+    last_update: Option<(Instant, MicroSeconds, usize)>, // last update time and Priority
+    virtual_time: BinaryHeap<Reverse<(MicroSeconds, usize)>>, // virtual time spent for each priority
+    weight: Vec<usize>,     // weight for each priority in non-contention window
+    c_window: MicroSeconds, // contention window
+    n_window: MicroSeconds, // non-contention window
+    is_contention: bool,    // contention window flag
+    length: usize,          // number of priorities
+}
+
+// instead of a wrr schduler, it actually is a hybrid scheduler
+impl SchedulerTrait for WRRScheduler {
+    fn reset(&mut self) {
+        self.c_window_start = None;
+        self.n_window_start = None;
+        self.last_update = None;
+        self.virtual_time.clear();
+        for i in 1..=self.length {
+            self.virtual_time.push(Reverse((0 as MicroSeconds, i)));
+        }
+        self.is_contention = true;
+    }
+    fn schedule(&mut self) -> ScheduleResult {
+        let now = Instant::now();
+        let mut stage_out = zlock!(self.stage_out);
+        // first update some states information
+        if self.is_contention {
+            // if currently in contention phase but the contention window has passed
+            if let Some(c_window_start) = self.c_window_start {
+                if now.duration_since(c_window_start) >= Duration::from_micros(self.c_window as u64)
+                {
+                    self.is_contention = false;
+                    self.n_window_start = Some(now);
+                    self.virtual_time.clear();
+                    for i in 1..=self.length {
+                        self.virtual_time.push(Reverse((0 as MicroSeconds, i)));
+                    }
+                    self.last_update = None;
+                }
+            } else {
+                self.c_window_start = Some(now);
+            }
+        } else {
+            // if currently in non-contention phase, first update the virtual time
+            if let Some((last_time, last_vt, last_prio)) = self.last_update {
+                let elapsed = now.duration_since(last_time).as_micros() as MicroSeconds;
+                self.virtual_time.push(Reverse((
+                    last_vt + elapsed * self.weight[last_prio] as MicroSeconds,
+                    last_prio,
+                )));
+            }
+            if let Some(n_window_start) = self.n_window_start {
+                if now.duration_since(n_window_start) >= Duration::from_micros(self.n_window as u64)
+                {
+                    self.is_contention = true;
+                    self.c_window_start = Some(now);
+                }
+            } else {
+                self.n_window_start = Some(now);
+            }
+        }
+        let mut backoff = MicroSeconds::MAX;
+        let mut is_none = true;
+        if self.is_contention {
+            for (prio, queue) in stage_out.iter_mut().enumerate() {
+                match queue.try_pull() {
+                    Pull::Some(batch) => {
+                        return ScheduleResult::Some((batch, prio));
+                    }
+                    Pull::Backoff(deadline) => {
+                        backoff = deadline;
+                        is_none = false;
+                    }
+                    Pull::None => {}
+                }
+            }
+            if is_none {
+                return ScheduleResult::None;
+            } else {
+                return ScheduleResult::Backoff(backoff);
+            }
+        } else {
+            let mut temp = vec![];
+            while let Some(Reverse((vt, prio))) = self.virtual_time.pop() {
+                match stage_out[prio].try_pull() {
+                    Pull::Some(batch) => {
+                        // find the suitable priority
+                        // store the last update time and priority
+                        self.last_update = Some((now, vt, prio));
+                        // push back the virtual time to heap
+                        temp.iter().for_each(|x| {
+                            self.virtual_time.push(Reverse(*x));
+                        });
+                        return ScheduleResult::Some((batch, prio));
+                    }
+                    Pull::Backoff(deadline) => {
+                        backoff = deadline;
+                        is_none = false;
+                    }
+                    Pull::None => {}
+                }
+                // temporarily store the virtual time and priority
+                // will be pushed back later
+                temp.push((vt, prio));
+            }
+            // push back the virtual time to heap
+            temp.iter().for_each(|x| {
+                self.virtual_time.push(Reverse(*x));
+            });
+            self.last_update = None;
+            if is_none {
+                return ScheduleResult::None;
+            } else {
+                return ScheduleResult::Backoff(backoff);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct CustomScheduler {
+    stage_out: Arc<Mutex<Box<[StageOut]>>>,
+}
+
+impl SchedulerTrait for CustomScheduler {
+    fn reset(&mut self) {
+        unimplemented!("Custom Scheduler is not implemented yet");
+    }
+    fn schedule(&mut self) -> ScheduleResult {
+        unimplemented!("Custom Scheduler is not implemented yet");
+    }
+}
+
 pub(crate) struct TransmissionPipelineConsumer {
     // A single Mutex for all the priority queues
-    stage_out: Box<[StageOut]>,
+    stage_out: Arc<Mutex<Box<[StageOut]>>>,
+    scheduler: Box<dyn SchedulerTrait + Send + Sync>,
     n_out_r: Waiter,
     active: Arc<AtomicBool>,
     #[cfg(feature = "qstats")]
@@ -792,25 +1041,23 @@ impl TransmissionPipelineConsumer {
         while self.active.load(Ordering::Relaxed) {
             let mut backoff = MicroSeconds::MAX;
             // Calculate the backoff maximum
-            for (prio, queue) in self.stage_out.iter_mut().enumerate() {
-                match queue.try_pull() {
-                    Pull::Some(batch) => {
-                        #[cfg(feature = "qstats")]
-                        {
-                            let qstat = &self.qstats_list[prio];
-                            batch.time.iter().for_each(|t| {
-                                qstat.dec_qcnt();
-                                qstat.push_qdelay(t.elapsed().as_micros() as usize);
-                            });
-                        }
-                        return Some((batch, prio));
+            let schedres = self.scheduler.schedule();
+            match schedres {
+                ScheduleResult::Some((batch, prio)) => {
+                    #[cfg(feature = "qstats")]
+                    {
+                        let qstat = &self.qstats_list[prio];
+                        batch.time.iter().for_each(|t| {
+                            qstat.dec_qcnt();
+                            qstat.push_qdelay(t.elapsed().as_micros() as usize);
+                        });
                     }
-                    Pull::Backoff(deadline) => {
-                        backoff = deadline;
-                        break;
-                    }
-                    Pull::None => {}
+                    return Some((batch, prio));
                 }
+                ScheduleResult::Backoff(deadline) => {
+                    backoff = deadline;
+                }
+                ScheduleResult::None => {}
             }
 
             // In case of writing many small messages, `recv_async()` will most likely return immedietaly.
@@ -843,7 +1090,8 @@ impl TransmissionPipelineConsumer {
     }
 
     pub(crate) fn refill(&mut self, batch: WBatch, priority: usize) {
-        self.stage_out[priority].refill(batch);
+        let mut stage_out = zlock!(self.stage_out);
+        stage_out[priority].refill(batch);
     }
 
     pub(crate) fn drain(&mut self) -> Vec<(WBatch, usize)> {
@@ -852,15 +1100,15 @@ impl TransmissionPipelineConsumer {
 
         // Acquire all the locks, in_guard first, out_guard later
         // Use the same locking order as in disable to avoid deadlocks
-        let locks = self
-            .stage_out
+        let mut stage_out = zlock!(self.stage_out);
+        let locks = stage_out
             .iter()
             .map(|x| x.s_in.current.clone())
             .collect::<Vec<_>>();
         let mut currents: Vec<MutexGuard<'_, Option<WBatch>>> =
             locks.iter().map(|x| zlock!(x)).collect::<Vec<_>>();
 
-        for (prio, s_out) in self.stage_out.iter_mut().enumerate() {
+        for (prio, s_out) in stage_out.iter_mut().enumerate() {
             let mut bs = s_out.drain(&mut currents[prio]);
             for b in bs.drain(..) {
                 batches.push((b, prio));
